@@ -165,6 +165,40 @@ redis-cli INCR ratelimit:user:99   # simulates "Request A", then crash
 redis-cli TTL ratelimit:user:99    # -> -1, stuck forever
 ```
 
+```
+TWO REQUESTS HIT SERVER AT SAME TIME
+                    |
+        ┌───────────┴───────────┐
+        │                       │
+   Request A                Request B
+        │                       │
+   INCR key                 INCR key
+        │                       │
+   ← returns 1             ← returns 2
+        │                       │
+   count == 1?             count == 1?
+      YES                      NO
+        │                       │
+   [about to EXPIRE]       [skips EXPIRE]
+        │
+      💥 CRASH
+   (before EXPIRE runs)
+        │
+        ▼
+   key = count:1
+   TTL  = -1  ← stuck forever!
+        │
+        ▼
+every future request just keeps incrementing
+        │
+        ▼
+   count: 2 → 3 → 4 → 5 ...
+   TTL still = -1
+        │
+        ▼
+   user rate-limited forever 🔴
+```
+
 ## 6. The fix: atomicity via Lua scripting (`EVAL`)
 
 Redis executes commands single-threaded, and a Lua script run via `EVAL`
@@ -197,6 +231,27 @@ redis-cli EVAL "local count = redis.call('INCR', KEYS[1]) if count == 1 then red
 Verified live: `TTL` went `3 → 1 → -2` with no `-1` ever observed — the
 increment and the expiry happened as one atomic step, closing the gap a
 crash could land in.
+
+```
+─────────────────────────────────────────
+THE FIX: Lua script (atomic, one trip)
+─────────────────────────────────────────
+
+   Request hits server
+        │
+        ▼
+   [INCR + EXPIRE as one atomic block]
+        │
+      Redis
+        │
+   ← count returned
+        │
+   count > limit?
+   ┌────┴────┐
+  YES        NO
+   │          │
+ reject     allow ✅
+```
 
 (Related but distinct tool for atomicity: Redis also supports
 `MULTI`/`EXEC` transactions and `SET key val EX seconds NX` — the latter
