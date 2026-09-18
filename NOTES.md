@@ -137,6 +137,47 @@ This is also why `INCR` alone is safe: it can never race with itself. The
 danger only appears once application code bolts a **second**, unrelated
 Redis call onto it.
 
+**Point-wise recap — auto-vivification + TOCTOU, why they combine into the
+bug in §5:**
+
+- Redis keys have no TTL by default. A normally-created key's TTL is
+  `-1` — it never expires on its own.
+- `INCR` auto-vivifies: on a missing key it treats the value as `0`,
+  increments to `1`, creates the key, and that key's TTL starts at `-1`.
+- `INCR` itself is atomic and race-safe: two simultaneous `INCR`s on the
+  same key can never both return `1` — Redis serializes them (`1` then
+  `2`, in some order, never a duplicate).
+- A rate limiter needs the counter to *expire* — e.g. 5 requests per 60s
+  means `INCR key` followed by `EXPIRE key 60`.
+- The naive fix only sets the TTL on the first request:
+
+  ```
+  count = INCR(key)
+  if count == 1:
+      EXPIRE(key, 60)
+  if count > 5:
+      reject
+  ```
+
+- The bug: `INCR` and `EXPIRE` are two separate Redis calls with
+  application logic (`count == 1`) sitting in the gap between them. If
+  the server crashes after `INCR` but before `EXPIRE`, the key is left
+  at `count = 1`, `TTL = -1` — permanently unexpiring. Every future
+  request just does `INCR → 2 → 3 → 4 → ...`; `count == 1` is never true
+  again, so `EXPIRE` never runs, and the key is stuck forever.
+- Two concurrent requests make the race concrete: Request A gets `1`
+  (the one that *would* call `EXPIRE`), Request B gets `2` (which skips
+  `EXPIRE` entirely). If A crashes before its `EXPIRE`, B cannot rescue
+  it — B never saw `count == 1`.
+- This is the general TOCTOU/timing-gap shape: one logical operation
+  ("increment, and if this was the first write, set a TTL") gets split
+  into multiple round-trips with app logic between them, and any
+  crash/network gap in that space leaves the system in an inconsistent
+  state.
+- The fix (detailed in §6): push the whole `INCR` → `if count == 1` →
+  `EXPIRE` sequence server-side into one atomic Lua script, so there is
+  no crash/network gap between the increment and the conditional expiry.
+
 ## 5. The TOCTOU bug in fixed-window rate limiting
 
 Naive fixed-window logic:
